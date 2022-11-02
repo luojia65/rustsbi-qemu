@@ -1,5 +1,7 @@
 use crate::{clint, hart_id, qemu_hsm::QemuHsm, FixedRustSBI, Supervisor};
 use core::arch::asm;
+use core::mem::size_of;
+use memoffset::offset_of;
 use riscv::register::*;
 use rustsbi::spec::binary::SbiRet;
 
@@ -58,12 +60,12 @@ impl<'a> Environment<'a> {
     fn handle_ecall(&mut self) -> Option<Operation> {
         use rustsbi::spec::{binary::*, hsm::*, srst::*};
         if self.ctx.sbi_extension() == sbi_spec::legacy::LEGACY_CONSOLE_PUTCHAR {
-            let ch = self.ctx.a(0);
+            let ch = self.ctx.a0;
             print!("{:}", ch as u8 as char);
             self.ctx.mepc = self.ctx.mepc.wrapping_add(4);
             return None;
         } else if self.ctx.sbi_extension() == sbi_spec::legacy::LEGACY_CONSOLE_GETCHAR {
-            *self.ctx.a_mut(0) = unsafe { crate::UART.lock().assume_init_mut().receive() } as usize;
+            self.ctx.a0 = unsafe { crate::UART.lock().assume_init_mut().receive() } as usize;
             self.ctx.mepc = self.ctx.mepc.wrapping_add(4);
             return None;
         }
@@ -79,7 +81,7 @@ impl<'a> Environment<'a> {
                 (EID_HSM, HART_STOP) => return Some(Operation::Stop),
                 (EID_HSM, HART_SUSPEND)
                     if matches!(
-                        u32::try_from(self.ctx.a(0)),
+                        u32::try_from(self.ctx.a0),
                         Ok(HART_SUSPEND_TYPE_NON_RETENTIVE)
                     ) =>
                 {
@@ -88,7 +90,7 @@ impl<'a> Environment<'a> {
                 // 系统重置
                 (EID_SRST, SYSTEM_RESET)
                     if matches!(
-                        u32::try_from(self.ctx.a(0)),
+                        u32::try_from(self.ctx.a0),
                         Ok(RESET_TYPE_COLD_REBOOT) | Ok(RESET_TYPE_WARM_REBOOT)
                     ) =>
                 {
@@ -120,11 +122,40 @@ impl<'a> Environment<'a> {
     }
 }
 
-#[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct SupervisorContext {
     msp: usize,
-    x: [usize; 31],
+    ra: usize,
+    sp: usize,
+    gp: usize,
+    tp: usize,
+    t0: usize,
+    t1: usize,
+    t2: usize,
+    s0: usize,
+    s1: usize,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    s2: usize,
+    s3: usize,
+    s4: usize,
+    s5: usize,
+    s6: usize,
+    s7: usize,
+    s8: usize,
+    s9: usize,
+    s10: usize,
+    s11: usize,
+    t3: usize,
+    t4: usize,
+    t5: usize,
+    t6: usize,
     mstatus: usize,
     mepc: usize,
 }
@@ -132,10 +163,8 @@ struct SupervisorContext {
 impl SupervisorContext {
     fn new(supervisor: Supervisor) -> Self {
         let mut ctx = Self {
-            msp: 0,
-            x: [0; 31],
-            mstatus: 0,
             mepc: supervisor.start_addr,
+            ..Default::default()
         };
 
         unsafe {
@@ -143,58 +172,41 @@ impl SupervisorContext {
             mstatus::set_mpie();
             asm!("csrr {}, mstatus", out(reg) ctx.mstatus)
         };
-        *ctx.a_mut(0) = hart_id();
-        *ctx.a_mut(1) = supervisor.opaque;
+        *ctx.hart_id_mut() = hart_id();
+        *ctx.opaque_mut() = supervisor.opaque;
 
         ctx
     }
 
     #[inline]
     fn sbi_extension(&self) -> usize {
-        self.a(7)
+        self.a7
     }
 
     #[inline]
     fn sbi_function(&self) -> usize {
-        self.a(6)
+        self.a6
     }
 
     #[inline]
     fn sbi_param(&self) -> [usize; 6] {
-        [
-            self.a(0),
-            self.a(1),
-            self.a(2),
-            self.a(3),
-            self.a(4),
-            self.a(5),
-        ]
+        [self.a0, self.a1, self.a2, self.a3, self.a4, self.a5]
     }
 
     #[inline]
     fn fill_in(&mut self, ans: SbiRet) {
-        *self.a_mut(0) = ans.error;
-        *self.a_mut(1) = ans.value;
+        self.a0 = ans.error;
+        self.a1 = ans.value;
     }
 
     #[inline]
-    fn x(&self, n: usize) -> usize {
-        self.x[n - 1]
+    fn hart_id_mut(&mut self) -> &mut usize {
+        &mut self.a0
     }
 
     #[inline]
-    fn x_mut(&mut self, n: usize) -> &mut usize {
-        &mut self.x[n - 1]
-    }
-
-    #[inline]
-    fn a(&self, n: usize) -> usize {
-        self.x(n + 10)
-    }
-
-    #[inline]
-    fn a_mut(&mut self, n: usize) -> &mut usize {
-        self.x_mut(n + 10)
+    fn opaque_mut(&mut self) -> &mut usize {
+        &mut self.a1
     }
 
     #[allow(unused)]
@@ -231,6 +243,25 @@ impl SupervisorContext {
     }
 }
 
+struct MachineContext {
+    supervisor_context: usize,
+    ra: usize,
+    gp: usize,
+    tp: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    s3: usize,
+    s4: usize,
+    s5: usize,
+    s6: usize,
+    s7: usize,
+    s8: usize,
+    s9: usize,
+    s10: usize,
+    s11: usize,
+}
+
 /// M 态转到 S 态。
 ///
 /// # Safety
@@ -241,50 +272,122 @@ impl SupervisorContext {
 #[naked]
 unsafe extern "C" fn m_to_s() {
     asm!(
-        r"  .altmacro
-            .macro SAVE_M n
-                sd x\n, \n*8(sp)
-            .endm
-            .macro LOAD_S n
-                ld x\n, \n*8(sp)
-            .endm
-        ",
         // 初始化栈帧：sp = Mctx
-        "   addi sp, sp, -32*8",
+        "addi  sp, sp, -{machine_context}",
         // 特权上下文地址保存到机器上下文
-        "   csrr  t0, mscratch
-            sd    t0, (sp)
-        ",
+        "csrr  t0, mscratch",
+        "sd  t0, {supervisor_context}(sp)",
         // 保存机器上下文
-        "   .set n, 1
-            .rept 31
-                SAVE_M %n
-                .set n, n+1
-            .endr
-        ",
+        "sd  ra, {machine_ra}(sp)",
+        "sd  gp, {machine_gp}(sp)",
+        "sd  tp, {machine_tp}(sp)",
+        "sd  s0, {machine_s0}(sp)",
+        "sd  s1, {machine_s1}(sp)",
+        "sd  s2, {machine_s2}(sp)",
+        "sd  s3, {machine_s3}(sp)",
+        "sd  s4, {machine_s4}(sp)",
+        "sd  s5, {machine_s5}(sp)",
+        "sd  s6, {machine_s6}(sp)",
+        "sd  s7, {machine_s7}(sp)",
+        "sd  s8, {machine_s8}(sp)",
+        "sd  s9, {machine_s9}(sp)",
+        "sd  s10, {machine_s10}(sp)",
+        "sd  s11, {machine_s11}(sp)",
         // 切换上下文：sp = Sctx
-        "   csrrw sp, mscratch, sp",
+        "csrrw sp, mscratch, sp",
         // 机器上下文地址保存到特权上下文
-        "   csrr  t0, mscratch
-            sd    t0, (sp)
-        ",
+        "csrr  t0, mscratch",
+        "sd  t0, {machine_sp}(sp)",
         // 恢复 csr
-        "   ld   t0, 32*8(sp)
-            ld   t1, 33*8(sp)
-            csrw mstatus, t0
-            csrw    mepc, t1
-        ",
+        "ld  t0, {supervisor_mstatus}(sp)",
+        "ld  t1, {supervisor_mepc}(sp)",
+        "csrw  mstatus, t0",
+        "csrw  mepc, t1",
         // 恢复特权上下文
-        "   ld x1, 1*8(sp)
-            .set n, 3
-            .rept 29
-                LOAD_S %n
-                .set n, n+1
-            .endr
-            ld sp, 2*8(sp)
-        ",
+        "ld  ra, {supervisor_ra}(sp)",
+        "ld  gp, {supervisor_gp}(sp)",
+        "ld  tp, {supervisor_tp}(sp)",
+        "ld  t0, {supervisor_t0}(sp)",
+        "ld  t1, {supervisor_t1}(sp)",
+        "ld  t2, {supervisor_t2}(sp)",
+        "ld  s0, {supervisor_s0}(sp)",
+        "ld  s1, {supervisor_s1}(sp)",
+        "ld  a0, {supervisor_a0}(sp)",
+        "ld  a1, {supervisor_a1}(sp)",
+        "ld  a2, {supervisor_a2}(sp)",
+        "ld  a3, {supervisor_a3}(sp)",
+        "ld  a4, {supervisor_a4}(sp)",
+        "ld  a5, {supervisor_a5}(sp)",
+        "ld  a6, {supervisor_a6}(sp)",
+        "ld  a7, {supervisor_a7}(sp)",
+        "ld  s2, {supervisor_s2}(sp)",
+        "ld  s3, {supervisor_s3}(sp)",
+        "ld  s4, {supervisor_s4}(sp)",
+        "ld  s5, {supervisor_s5}(sp)",
+        "ld  s6, {supervisor_s6}(sp)",
+        "ld  s7, {supervisor_s7}(sp)",
+        "ld  s8, {supervisor_s8}(sp)",
+        "ld  s9, {supervisor_s9}(sp)",
+        "ld  s10, {supervisor_s10}(sp)",
+        "ld  s11, {supervisor_s11}(sp)",
+        "ld  t3, {supervisor_t3}(sp)",
+        "ld  t4, {supervisor_t4}(sp)",
+        "ld  t5, {supervisor_t5}(sp)",
+        "ld  t6, {supervisor_t6}(sp)",
+        "ld  sp, {supervisor_sp}(sp)",
         // 执行特权程序
-        "   mret",
+        "mret",
+        machine_context = const size_of::<MachineContext>(),
+        machine_ra = const offset_of!(MachineContext, ra),
+        machine_gp = const offset_of!(MachineContext, gp),
+        machine_tp = const offset_of!(MachineContext, tp),
+        machine_s0 = const offset_of!(MachineContext, s0),
+        machine_s1 = const offset_of!(MachineContext, s1),
+        machine_s2 = const offset_of!(MachineContext, s2),
+        machine_s3 = const offset_of!(MachineContext, s3),
+        machine_s4 = const offset_of!(MachineContext, s4),
+        machine_s5 = const offset_of!(MachineContext, s5),
+        machine_s6 = const offset_of!(MachineContext, s6),
+        machine_s7 = const offset_of!(MachineContext, s7),
+        machine_s8 = const offset_of!(MachineContext, s8),
+        machine_s9 = const offset_of!(MachineContext, s9),
+        machine_s10 = const offset_of!(MachineContext, s10),
+        machine_s11 = const offset_of!(MachineContext, s11),
+        machine_sp = const offset_of!(SupervisorContext, msp),
+        supervisor_context = const offset_of!(MachineContext, supervisor_context),
+        supervisor_mstatus = const offset_of!(SupervisorContext, mstatus),
+        supervisor_mepc = const offset_of!(SupervisorContext, mepc),
+        supervisor_ra = const offset_of!(SupervisorContext, ra),
+        supervisor_gp = const offset_of!(SupervisorContext, gp),
+        supervisor_tp = const offset_of!(SupervisorContext, tp),
+        supervisor_t0 = const offset_of!(SupervisorContext, t0),
+        supervisor_t1 = const offset_of!(SupervisorContext, t1),
+        supervisor_t2 = const offset_of!(SupervisorContext, t2),
+        supervisor_s0 = const offset_of!(SupervisorContext, s0),
+        supervisor_s1 = const offset_of!(SupervisorContext, s1),
+        supervisor_a0 = const offset_of!(SupervisorContext, a0),
+        supervisor_a1 = const offset_of!(SupervisorContext, a1),
+        supervisor_a2 = const offset_of!(SupervisorContext, a2),
+        supervisor_a3 = const offset_of!(SupervisorContext, a3),
+        supervisor_a4 = const offset_of!(SupervisorContext, a4),
+        supervisor_a5 = const offset_of!(SupervisorContext, a5),
+        supervisor_a6 = const offset_of!(SupervisorContext, a6),
+        supervisor_a7 = const offset_of!(SupervisorContext, a7),
+        supervisor_s2 = const offset_of!(SupervisorContext, s2),
+        supervisor_s3 = const offset_of!(SupervisorContext, s3),
+        supervisor_s4 = const offset_of!(SupervisorContext, s4),
+        supervisor_s5 = const offset_of!(SupervisorContext, s5),
+        supervisor_s6 = const offset_of!(SupervisorContext, s6),
+        supervisor_s7 = const offset_of!(SupervisorContext, s7),
+        supervisor_s8 = const offset_of!(SupervisorContext, s8),
+        supervisor_s9 = const offset_of!(SupervisorContext, s9),
+        supervisor_s10 = const offset_of!(SupervisorContext, s10),
+        supervisor_s11 = const offset_of!(SupervisorContext, s11),
+        supervisor_t3 = const offset_of!(SupervisorContext, t3),
+        supervisor_t4 = const offset_of!(SupervisorContext, t4),
+        supervisor_t5 = const offset_of!(SupervisorContext, t5),
+        supervisor_t6 = const offset_of!(SupervisorContext, t6),
+        supervisor_sp = const offset_of!(SupervisorContext, sp),
         options(noreturn)
     )
 }
@@ -296,50 +399,121 @@ unsafe extern "C" fn m_to_s() {
 /// 裸函数。
 /// 利用恢复的 ra 回到 [`m_to_s`] 的返回地址。
 #[naked]
-unsafe extern "C" fn s_to_m() {
+unsafe extern "C" fn s_to_m() -> ! {
     asm!(
-        r"
-        .altmacro
-        .macro SAVE_S n
-            sd x\n, \n*8(sp)
-        .endm
-        .macro LOAD_M n
-            ld x\n, \n*8(sp)
-        .endm
-        ",
         // 切换上下文：sp = Sctx
-        "   csrrw sp, mscratch, sp
-            ld    sp, (sp)
-        ",
+        "csrrw sp, mscratch, sp",
+        "ld  sp, {supervisor_context}(sp)",
         // 保存特权上下文
-        "   sd x1, 1*8(sp)
-            .set n, 3
-            .rept 29
-                SAVE_S %n
-                .set n, n+1
-            .endr
-            csrrw t0, mscratch, sp
-            sd    t0,  2*8(sp)
-        ",
+        "sd  ra, {supervisor_ra}(sp)",
+        "sd  gp, {supervisor_gp}(sp)",
+        "sd  tp, {supervisor_tp}(sp)",
+        "sd  t0, {supervisor_t0}(sp)",
+        "sd  t1, {supervisor_t1}(sp)",
+        "sd  t2, {supervisor_t2}(sp)",
+        "sd  s0, {supervisor_s0}(sp)",
+        "sd  s1, {supervisor_s1}(sp)",
+        "sd  a0, {supervisor_a0}(sp)",
+        "sd  a1, {supervisor_a1}(sp)",
+        "sd  a2, {supervisor_a2}(sp)",
+        "sd  a3, {supervisor_a3}(sp)",
+        "sd  a4, {supervisor_a4}(sp)",
+        "sd  a5, {supervisor_a5}(sp)",
+        "sd  a6, {supervisor_a6}(sp)",
+        "sd  a7, {supervisor_a7}(sp)",
+        "sd  s2, {supervisor_s2}(sp)",
+        "sd  s3, {supervisor_s3}(sp)",
+        "sd  s4, {supervisor_s4}(sp)",
+        "sd  s5, {supervisor_s5}(sp)",
+        "sd  s6, {supervisor_s6}(sp)",
+        "sd  s7, {supervisor_s7}(sp)",
+        "sd  s8, {supervisor_s8}(sp)",
+        "sd  s9, {supervisor_s9}(sp)",
+        "sd  s10, {supervisor_s10}(sp)",
+        "sd  s11, {supervisor_s11}(sp)",
+        "sd  t3, {supervisor_t3}(sp)",
+        "sd  t4, {supervisor_t4}(sp)",
+        "sd  t5, {supervisor_t5}(sp)",
+        "sd  t6, {supervisor_t6}(sp)",
+        "csrrw  t0, mscratch, sp",
+        "sd  t0, {supervisor_sp}(sp)",
         // 保存 csr
-        "   csrr t1, mstatus
-            csrr t2, mepc
-            sd   t1, 32*8(sp)
-            sd   t2, 33*8(sp)
-        ",
+        "csrr  t0, mstatus",
+        "csrr  t1, mepc",
+        "sd  t0, {supervisor_mstatus}(sp)",
+        "sd  t1, {supervisor_mepc}(sp)",
         // 切换上下文：sp = Mctx
-        "   ld sp, (sp)",
+        "ld  sp, {machine_sp}(sp)",
         // 恢复机器上下文
-        "   .set n, 1
-            .rept 31
-                LOAD_M %n
-                .set n, n+1
-            .endr
-        ",
+        "ld  ra, {machine_ra}(sp)",
+        "ld  gp, {machine_gp}(sp)",
+        "ld  tp, {machine_tp}(sp)",
+        "ld  s0, {machine_s0}(sp)",
+        "ld  s1, {machine_s1}(sp)",
+        "ld  s2, {machine_s2}(sp)",
+        "ld  s3, {machine_s3}(sp)",
+        "ld  s4, {machine_s4}(sp)",
+        "ld  s5, {machine_s5}(sp)",
+        "ld  s6, {machine_s6}(sp)",
+        "ld  s7, {machine_s7}(sp)",
+        "ld  s8, {machine_s8}(sp)",
+        "ld  s9, {machine_s9}(sp)",
+        "ld  s10, {machine_s10}(sp)",
+        "ld  s11, {machine_s11}(sp)",
         // 栈帧释放，返回
-        "   addi sp, sp, 32*8
-            ret
-        ",
+        "addi  sp, sp, {machine_context}",
+        "ret",
+        supervisor_context = const offset_of!(MachineContext, supervisor_context),
+        supervisor_ra = const offset_of!(SupervisorContext, ra),
+        supervisor_gp = const offset_of!(SupervisorContext, gp),
+        supervisor_tp = const offset_of!(SupervisorContext, tp),
+        supervisor_t0 = const offset_of!(SupervisorContext, t0),
+        supervisor_t1 = const offset_of!(SupervisorContext, t1),
+        supervisor_t2 = const offset_of!(SupervisorContext, t2),
+        supervisor_s0 = const offset_of!(SupervisorContext, s0),
+        supervisor_s1 = const offset_of!(SupervisorContext, s1),
+        supervisor_a0 = const offset_of!(SupervisorContext, a0),
+        supervisor_a1 = const offset_of!(SupervisorContext, a1),
+        supervisor_a2 = const offset_of!(SupervisorContext, a2),
+        supervisor_a3 = const offset_of!(SupervisorContext, a3),
+        supervisor_a4 = const offset_of!(SupervisorContext, a4),
+        supervisor_a5 = const offset_of!(SupervisorContext, a5),
+        supervisor_a6 = const offset_of!(SupervisorContext, a6),
+        supervisor_a7 = const offset_of!(SupervisorContext, a7),
+        supervisor_s2 = const offset_of!(SupervisorContext, s2),
+        supervisor_s3 = const offset_of!(SupervisorContext, s3),
+        supervisor_s4 = const offset_of!(SupervisorContext, s4),
+        supervisor_s5 = const offset_of!(SupervisorContext, s5),
+        supervisor_s6 = const offset_of!(SupervisorContext, s6),
+        supervisor_s7 = const offset_of!(SupervisorContext, s7),
+        supervisor_s8 = const offset_of!(SupervisorContext, s8),
+        supervisor_s9 = const offset_of!(SupervisorContext, s9),
+        supervisor_s10 = const offset_of!(SupervisorContext, s10),
+        supervisor_s11 = const offset_of!(SupervisorContext, s11),
+        supervisor_t3 = const offset_of!(SupervisorContext, t3),
+        supervisor_t4 = const offset_of!(SupervisorContext, t4),
+        supervisor_t5 = const offset_of!(SupervisorContext, t5),
+        supervisor_t6 = const offset_of!(SupervisorContext, t6),
+        supervisor_mstatus = const offset_of!(SupervisorContext, mstatus),
+        supervisor_mepc = const offset_of!(SupervisorContext, mepc),
+        supervisor_sp = const offset_of!(SupervisorContext, sp),
+        machine_sp = const offset_of!(SupervisorContext, msp),
+        machine_ra = const offset_of!(MachineContext, ra),
+        machine_gp = const offset_of!(MachineContext, gp),
+        machine_tp = const offset_of!(MachineContext, tp),
+        machine_s0 = const offset_of!(MachineContext, s0),
+        machine_s1 = const offset_of!(MachineContext, s1),
+        machine_s2 = const offset_of!(MachineContext, s2),
+        machine_s3 = const offset_of!(MachineContext, s3),
+        machine_s4 = const offset_of!(MachineContext, s4),
+        machine_s5 = const offset_of!(MachineContext, s5),
+        machine_s6 = const offset_of!(MachineContext, s6),
+        machine_s7 = const offset_of!(MachineContext, s7),
+        machine_s8 = const offset_of!(MachineContext, s8),
+        machine_s9 = const offset_of!(MachineContext, s9),
+        machine_s10 = const offset_of!(MachineContext, s10),
+        machine_s11 = const offset_of!(MachineContext, s11),
+        machine_context = const size_of::<MachineContext>(),
         options(noreturn)
     )
 }
