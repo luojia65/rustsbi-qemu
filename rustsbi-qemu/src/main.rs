@@ -112,6 +112,7 @@ extern "C" fn rust_main(hartid: usize, opaque: usize) {
         // 初始化 SBI
         unsafe {
             SBI = MaybeUninit::new(FixedRustSBI {
+                console: Console,
                 clint: &clint::Clint,
                 hsm: Hsm,
                 reset: qemu_test::get(),
@@ -324,10 +325,47 @@ impl rcore_console::Console for Console {
     }
 }
 
+impl rustsbi::Console for Console {
+    #[inline]
+    fn write(&self, bytes: rustsbi::Physical<&[u8]>) -> SbiRet {
+        // TODO: pointer address validation
+        let ptr = bytes.phys_addr_lo() as *mut u8;
+        let len = bytes.num_bytes();
+        let slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+        let mut uart = UART.lock();
+        let uart = unsafe { uart.assume_init_mut() };
+        for byte in slice {
+            *byte = uart.receive();
+        }
+        SbiRet::success(len)
+    }
+    #[inline]
+    fn read(&self, bytes: rustsbi::Physical<&mut [u8]>) -> SbiRet {
+        // TODO: pointer address validation
+        let ptr = bytes.phys_addr_lo() as *const u8;
+        let len = bytes.num_bytes();
+        let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+        let mut uart = UART.lock();
+        let uart = unsafe { uart.assume_init_mut() };
+        for byte in slice {
+            uart.send(*byte);
+        }
+        SbiRet::success(len)
+    }
+    #[inline]
+    fn write_byte(&self, byte: u8) -> rustsbi::SbiRet {
+        let mut uart = UART.lock();
+        let uart = unsafe { uart.assume_init_mut() };
+        uart.send(byte);
+        rustsbi::SbiRet::success(0)
+    }
+}
+
 static mut SBI: MaybeUninit<FixedRustSBI> = MaybeUninit::uninit();
 
 #[derive(RustSBI)]
 struct FixedRustSBI<'a> {
+    console: Console,
     #[rustsbi(ipi, timer)]
     clint: &'a clint::Clint,
     hsm: Hsm,
@@ -365,6 +403,7 @@ impl rustsbi::Hsm for Hsm {
         }
     }
 
+    #[inline]
     fn hart_suspend(&self, suspend_type: u32, _resume_addr: usize, _opaque: usize) -> SbiRet {
         use rustsbi::spec::hsm::suspend_type::{NON_RETENTIVE, RETENTIVE};
         if matches!(suspend_type, NON_RETENTIVE | RETENTIVE) {
